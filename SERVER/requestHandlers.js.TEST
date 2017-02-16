@@ -1,0 +1,316 @@
+var querystring = require("querystring"); 
+var url = require("url");
+var http = require("http");
+var fs = require("fs");
+var formidable = require("formidable");
+var sys = require("sys");
+var customer = require("./customer.js");
+var nodemailer = require("nodemailer");
+var smtpTransport = require("nodemailer-smtp-transport");
+var ObjectId = require('mongodb').ObjectId;
+
+var exec = require("child_process").exec;
+var myUndefined = [ undefined, "undefined" ];
+
+var attributesFix = {};
+customer.getAttFix( function(attFix) {
+	attributesFix = attFix;
+});
+
+function getCustomer(response, request, dbcnx, db) {	
+	console.log("request.url = " + request.url);
+	
+	var action = url.parse(request.url, true).query.action;
+	var username = url.parse(request.url, true).query.username;
+	var password = url.parse(request.url, true).query.password;
+	var id = url.parse(request.url, true).query.id;
+	
+	if ( ( myUndefined.indexOf(id) >= 0 && myUndefined.indexOf(username) >= 0 ) || ( action == "login" && ( myUndefined.indexOf(username) >= 0 || myUndefined.indexOf(password) >= 0 ) ) || ( action != "login" && myUndefined.indexOf(id) >= 0 ) ) {
+	//if ( ( id == undefined && username == undefined ) || ( action == "login" && ( username == undefined || password == undefined ) ) || ( action != "login" && id == undefined ) ) {
+		response.writeHead(401, {"Content-Type" : "text/plain", "Access-Control-Allow-Origin" : "*"});
+		var body = "{\n\"status\": \"ERROR\",\n" +
+					"\"errormessage\": \"Bad URL\"\n}";
+		response.write(body, function(err) { response.end(); } );
+		return;
+	}
+	
+	var noUser = 0;
+	var query;	
+	var queryUsername = {};
+	
+	function queryAndRespond(query) {
+		customer.doGet(dbcnx, db, query, function(attList) {
+			if (attList != null) {
+				response.writeHead(200, {"Content-Type" : "text/plain", "Access-Control-Allow-Origin" : "*"});
+				var body = "{\n\"status\": \"SUCCESS\",\n" + 
+							"\"action\": \"" + action + "\"";
+				//response.write(body);
+				var fields = Object.keys(attList);
+				for ( var i = 0; i < fields.length; i++ ) {
+					body += ",\n\"" + fields[i] + "\": \"" + attList[fields[i]] + "\""; 
+					//response.write(body);
+					if ( i == (fields.length - 1) ) {
+						body += "\n}";
+						response.write(body,function(err) { response.end(); });
+					}
+				}
+			} else {
+				response.writeHead(401, {"Content-Type" : "text/plain", "Access-Control-Allow-Origin" : "*"});
+				var body = "{\n\"status\": \"ERROR\",\n" +
+							"\"errormessage\": \"Wrong credentials\",\n" + 
+							"\"action\": \"" + action + "\"\n}";
+				response.write(body, function(err) { response.end(); } );
+			}
+		});
+	}
+	
+	if ( action == "login" ) {
+		queryUsername["username"] = { "fix": attributesFix["username"], "value": username };
+		customer.doGet(dbcnx, db, queryUsername, function(userAtt) {
+			if ( userAtt == null ) {
+				noUser = 1;
+				response.writeHead(401, {"Content-Type" : "text/plain", "Access-Control-Allow-Origin" : "*"});
+				var body = "{\n\"status\": \"ERROR\",\n" +
+							"\"errormessage\": \"User not registered\",\n" + 
+							"\"action\": \"" + action + "\"\n}";
+				response.write(body, function(err) { response.end(); } );
+			} else {
+				query = { 
+					"username": { "fix": attributesFix["username"], "value": username }, 
+					"password": { "fix": attributesFix["password"], "value": password }
+				}
+				queryAndRespond(query);
+			}
+		});
+	} else {
+		console.log("query = { \"_id\": ObjectId(" + id + ") }");
+		query = { "_id": ObjectId(id) }
+		queryAndRespond(query)
+	}
+}
+
+function register(response, request, dbcnx, db) {
+	console.log("request.url = " + request.url);
+	var action = url.parse(request.url, true).query.action;
+	
+	var insertQuery = {};
+	for ( var field in url.parse(request.url, true).query ) {
+		var fieldQuery = { "fix": attributesFix[field], "value": url.parse(request.url, true).query[field] };
+		insertQuery[field] = fieldQuery;
+	}	
+	
+	customer.doInsert(dbcnx, db, insertQuery, function(username,password,exists,message){
+		if ( exists == 0 ) {
+			var query = {
+				"username": insertQuery["username"],
+				"password": insertQuery["password"]
+			}
+		//customer.getFromCredentials(dbcnx, db, username, password, function(attList) {
+			customer.doGet(dbcnx, db, query, function(attList) {
+				if (attList != null) {
+					response.writeHead(200, {"Content-Type" : "text/plain", "Access-Control-Allow-Origin" : "*"});
+					var body = "{\n\"status\": \"SUCCESS\",\n" + 
+								"\"action\": \"" + action + "\"";
+					//response.write(body);
+					var fields = Object.keys(attList);
+					for ( var i = 0; i < fields.length; i++ ) {
+						body += ",\n\"" + fields[i] + "\": \"" + attList[fields[i]] + "\""; 
+						//response.write(body);
+						if ( i == (fields.length - 1) ) {
+						body += "\n}";
+							response.write(body,function(err) { response.end(); });
+						}
+					}
+				} else {
+					response.writeHead(401, {"Content-Type" : "text/plain", "Access-Control-Allow-Origin" : "*"});
+					var body = "{\n\"status\": \"ERROR\",\n" +
+								"\"errormessage\": \"Registration error\",\n" + 
+								"\"action\": \"" + action + "\"\n}";
+					response.write(body, function(err) { response.end(); } );
+					//response.end();
+				}
+			})
+		} else {
+			response.writeHead(401, {"Content-Type" : "text/plain", "Access-Control-Allow-Origin" : "*"});
+			var body = "{\n\"status\": \"ERROR\",\n" + 
+						"\"errormessage\": \"" + message + "\",\n" + 
+						"\"action\": \"" + action + "\"\n}";
+			response.write(body, function(err) { response.end(); } );
+		}
+	});
+}
+
+function checkCredentials(response, request, dbcnx, db) {	
+	console.log("request.url = " + request.url);
+	
+	var action = url.parse(request.url, true).query.action;
+	var username = url.parse(request.url, true).query.username;
+	var password = url.parse(request.url, true).query.password;
+	var id = url.parse(request.url, true).query.id;
+	
+	var queryUsername = {};
+	queryUsername["username"] = { "fix": attributesFix["username"], "value": username };
+	
+	customer.doGet(dbcnx, db, queryUsername, function(attList) {
+		if (attList != null) {
+			var query = { 
+				"username": { "fix": attributesFix["username"], "value": username }, 
+				"password": { "fix": attributesFix["password"], "value": password }
+			}
+			customer.doGet(dbcnx, db, query, function(attList) {
+				if (attList != null) {
+					response.writeHead(200, {"Content-Type" : "text/plain", "Access-Control-Allow-Origin" : "*"});
+					var body = "{\n\"status\": \"SUCCESS\",\n" + 
+								"\"action\": \"" + action + "\"";
+					//response.write(body);
+					var fields = Object.keys(attList);
+					for ( var i = 0; i < fields.length; i++ ) {
+						body += ",\n\"" + fields[i] + "\": \"" + attList[fields[i]] + "\""; 
+						//response.write(body);
+						if ( i == (fields.length - 1) ) {
+							body += "\n}";
+							response.write(body,function(err) { response.end(); });
+						}
+					}
+				} else {
+					response.writeHead(401, {"Content-Type" : "text/plain", "Access-Control-Allow-Origin" : "*"});
+					var body = "{\n\"status\": \"ERROR\",\n" +
+								"\"errormessage\": \"Wrong credentials\",\n" + 
+								"\"action\": \"" + action + "\"\n}";
+					response.write(body, function(err) { response.end(); } );
+				}
+			});
+		} else {
+			response.writeHead(401, {"Content-Type" : "text/plain", "Access-Control-Allow-Origin" : "*"});
+			var body = "{\n\"status\": \"ERROR\",\n" +
+						"\"errormessage\": \"User not registered\",\n" + 
+						"\"action\": \"" + action + "\"\n}";
+			response.write(body, function(err) { response.end(); } );
+		}
+	});
+}
+
+function getLostPassword(response, request, dbcnx, db) {
+	var username = url.parse(request.url, true).query.username;
+	var email = url.parse(request.url, true).query.email;
+	var query = {
+		"username": { "fix": attributesFix["username"], "value": username },
+		"email": { "fix": attributesFix["email"], "value": email }
+	}
+	
+	customer.doGet(dbcnx, db, query, function(attList) {
+		if ( attList == null ) {
+			var body = "{\n\"status\": \"ERROR\",\n" +
+						"\"errormessage\": \"Account not found\"\n}";
+			response.writeHead(401, {"Content-Type": "text/plain", "Access-Control-Allow-Origin" : "*"});
+			response.write(body, function(err) { response.end(); });
+		} else {
+			var email = attList["email"];
+			var password = attList["password"];
+			// setup e-mail transporter
+			var transporter = nodemailer.createTransport(smtpTransport({
+				host: "smtp-mail.outlook.com",
+				secureConnection: false,
+				port: 587,
+				auth: {
+					user: "arturo_noha@hotmail.com",
+					pass: "I1d9a0i6s1a3"
+				}
+			}));
+			// setup e-mail data with unicode symbols
+			var mailOptions = {
+				from: '"VenYa" <admin@venya.com>', // sender address
+				to: email, // list of receivers
+				subject: 'Lost Password', // Subject line
+				text: 'Your password is: ' + password, // plaintext body
+				html: '<b>Your password is ' + password + '</b>' // html body
+			};
+
+			// send mail with defined transport object
+			transporter.sendMail(mailOptions, function(error, info){
+				if(error){
+					var body = "{\n\"status\": \"ERROR\",\n" +
+							"\"errormessage\": \"failed to send email to " + email + "\",\n" +
+							"\"password\": \"" + password + "\"\n}";
+					response.writeHead(400, {"Content-Type": "text/plain", "Access-Control-Allow-Origin" : "*"});
+					response.write(body, function(err) { response.end(); });
+					return console.log(error);
+				}
+				console.log('Message sent: ' + info.response);
+				
+				var body = "{\n\"status\": \"SUCCESS\",\n" +
+							"\"errormessage\": \"credentials sent to " + email + "\",\n" +
+							"\"password\": \"" + password + "\"\n}";
+				response.writeHead(200, {"Content-Type": "text/plain", "Access-Control-Allow-Origin" : "*"});
+				response.write(body, function(err) { response.end(); });	
+			
+			});
+		}
+	});
+}
+
+function getLostUsername(response, request, dbcnx, db) {
+	var name = url.parse(request.url, true).query.name;
+	var password = url.parse(request.url, true).query.password;
+	var email = url.parse(request.url, true).query.email;
+	var query = {
+		"name": { "fix": attributesFix["name"], "value": name },
+		"password": { "fix": attributesFix["password"], "value": password },
+		"email": { "fix": attributesFix["email"], "value": email }
+	}
+	
+	customer.doGet(dbcnx, db, query, function(attList) {
+		if ( attList == null ) {
+			var body = "{\n\"status\": \"ERROR\",\n" +
+						"\"errormessage\": \"Account not found\"\n}";
+			response.writeHead(401, {"Content-Type": "text/plain", "Access-Control-Allow-Origin" : "*"});
+			response.write(body, function(err) { response.end(); });
+		} else {
+			var email = attList["email"];
+			var username = attList["username"];	
+			// setup e-mail transporter
+			var transporter = nodemailer.createTransport(smtpTransport({
+				host: "smtp-mail.outlook.com",
+				secureConnection: false,
+				port: 587,
+				auth: {
+					user: "arturo_noha@hotmail.com",
+					pass: "I1d9a0i6s1a3"
+				}
+			}));
+			// setup e-mail data with unicode symbols
+			var mailOptions = {
+				from: '"VenYa" <admin@venya.com>', // sender address
+				to: email, // list of receivers
+				subject: 'Lost Username', // Subject line
+				text: 'Your username is: ' + username, // plaintext body
+				html: '<b>Your username is ' + username + '</b>' // html body
+			};
+
+			// send mail with defined transport object
+			transporter.sendMail(mailOptions, function(error, info){
+				if(error){
+					var body = "{\n\"status\": \"ERROR\",\n" +
+							"\"errormessage\": \"failed to send email to " + email + "\",\n" +
+							"\"username\": \"" + username + "\"\n}";
+					response.writeHead(400, {"Content-Type": "text/plain", "Access-Control-Allow-Origin" : "*"});
+					response.write(body, function(err) { response.end(); });
+					return console.log(error);
+				}
+				console.log('Message sent: ' + info.response);
+				
+				var body = "{\n\"status\": \"SUCCESS\",\n" +
+							"\"errormessage\": \"credentials sent to " + email + "\",\n" +
+							"\"username\": \"" + username + "\"\n}";
+				response.writeHead(200, {"Content-Type": "text/plain", "Access-Control-Allow-Origin" : "*"});
+				response.write(body, function(err) { response.end(); });
+			});
+		}
+	}); 
+}
+
+exports.getCustomer = getCustomer;
+exports.checkCredentials = checkCredentials;
+exports.register = register;
+exports.getLostPassword = getLostPassword;
+exports.getLostUsername = getLostUsername;
